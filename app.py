@@ -249,10 +249,13 @@ def _google_books_query(q: str, api_key: Optional[str] = None):
     }
 
 def google_books_lookup_by_isbn_any(isbn: str, api_key: Optional[str] = None):
+    # 1) canonical isbn: query
     rec = _google_books_query(f"isbn:{isbn}", api_key)
     if rec:
         rec["isbn"] = isbn
         return rec
+
+    # 2) if 978* and valid, also try ISBN-10
     if isbn.isdigit() and len(isbn) == 13 and isbn.startswith("978"):
         alt10 = isbn13_to_isbn10(isbn)
         if alt10:
@@ -260,7 +263,21 @@ def google_books_lookup_by_isbn_any(isbn: str, api_key: Optional[str] = None):
             if rec:
                 rec["isbn"] = isbn
                 return rec
+
+    # 3) plain numeric search (some entries aren't indexed under isbn:)
+    rec = _google_books_query(isbn, api_key)
+    if rec:
+        rec["isbn"] = isbn
+        return rec
+
+    # 4) quoted exact search
+    rec = _google_books_query(f'"{isbn}"', api_key)
+    if rec:
+        rec["isbn"] = isbn
+        return rec
+
     return None
+
 
 def openlibrary_lookup_by_isbn(isbn: str):
     try:
