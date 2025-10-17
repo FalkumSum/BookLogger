@@ -6,3 +6,4 @@ requests
 pandas
 pillow
 zxing-cpp
+beautifulsoup4
