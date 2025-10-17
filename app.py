@@ -12,6 +12,9 @@ import gspread
 from google.oauth2.service_account import Credentials
 from gspread_dataframe import get_as_dataframe, set_with_dataframe
 
+# NEW: for web fallback scraping
+from bs4 import BeautifulSoup
+
 # Try zxing-cpp for barcode decoding (works on Streamlit Cloud)
 ZXING_READY = True
 try:
@@ -47,11 +50,13 @@ SHEET_NAME = require_secret("sheet", "name", example='[sheet]\nname = "book_logg
 WORKSHEET_NAME = require_secret("sheet", "worksheet")
 API_KEY = SECRETS.get("google_books", {}).get("api_key", "")
 
-# Base schema (will be created/extended automatically)
+# Optional: ISBNdb (if you want extra coverage; not required)
+ISBNDB_KEY = SECRETS.get("isbndb", {}).get("api_key", "")
+
+# Base schema
 HEADERS = [
     "id", "isbn", "title", "author", "rating", "notes", "thumbnail",
     "status", "date", "added_at",
-    # New metadata:
     "page_count", "published_date", "publisher", "categories", "language", "description"
 ]
 STATUS_OPTIONS = ["Wishlist", "Reading", "Finished"]
@@ -60,7 +65,6 @@ STATUS_OPTIONS = ["Wishlist", "Reading", "Finished"]
 # Small helpers
 # -----------------------------
 def safe_url(u):
-    """Return a clean http(s) URL or None (avoids NaN/float issues)."""
     if isinstance(u, str):
         u = u.strip()
         if u.lower().startswith(("http://", "https://")) and len(u) > 7:
@@ -72,6 +76,14 @@ def coerce_string(df: pd.DataFrame, cols: List[str]):
         if c in df.columns:
             df[c] = df[c].astype("string").fillna("")
             df[c] = df[c].replace("nan", "")
+
+def merge_meta(base: dict, extra: dict) -> dict:
+    """Fill missing fields in base with values from extra."""
+    merged = base.copy()
+    for k, v in extra.items():
+        if not merged.get(k) and v not in (None, "", 0):
+            merged[k] = v
+    return merged
 
 # -----------------------------
 # Google Sheets helpers
@@ -91,16 +103,12 @@ def get_ws():
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         df = pd.DataFrame(columns=HEADERS)
-
-    # Ensure all expected columns exist
     for col in HEADERS:
         if col not in df.columns:
             df[col] = "" if col not in ("rating", "id", "page_count") else 0
 
-    # Types / defaults
     df["id"] = pd.to_numeric(df["id"], errors="ignore")
     df["id"] = pd.to_numeric(df["id"], errors="coerce").fillna(0).astype(int)
-
     df["rating"] = pd.to_numeric(df["rating"], errors="coerce").fillna(0).astype(int).clip(0, 5)
     df["page_count"] = pd.to_numeric(df["page_count"], errors="coerce").fillna(0).astype(int)
 
@@ -110,11 +118,7 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         "published_date", "publisher", "categories", "language", "description"
     ]
     coerce_string(df, str_cols)
-
-    # Default status
     df["status"] = df["status"].replace("", "Wishlist")
-
-    # Keep column order stable
     return df[HEADERS]
 
 def read_df() -> pd.DataFrame:
@@ -136,7 +140,6 @@ def add_row(row: dict):
     row.setdefault("status", "Wishlist")
     row.setdefault("date", "")
     row.setdefault("rating", 0)
-    # fill new metadata defaults
     row.setdefault("page_count", 0)
     row.setdefault("published_date", "")
     row.setdefault("publisher", "")
@@ -155,7 +158,6 @@ def delete_rows(ids: List[int]):
 # ISBN utils
 # -----------------------------
 def clean_isbn(s: str) -> str:
-    """Uppercase, keep digits and X only."""
     return re.sub(r"[^0-9X]", "", (s or "").upper())
 
 def validate_isbn13(isbn13: str) -> bool:
@@ -178,24 +180,18 @@ def validate_isbn10(isbn10: str) -> bool:
     return (last == "X" and check == 10) or (last.isdigit() and check == int(last))
 
 def isbn13_to_isbn10(isbn13: str) -> Optional[str]:
-    """Convert 978* ISBN-13 to ISBN-10 (returns None if not convertible)."""
     if not (isbn13.startswith("978") and validate_isbn13(isbn13)):
         return None
-    core = isbn13[3:12]  # 9 digits
+    core = isbn13[3:12]
     total = sum((i + 1) * int(d) for i, d in enumerate(core))
     remainder = total % 11
     check = "X" if remainder == 10 else str(remainder)
     return core + check
 
 def extract_isbn13_from_text(s: str) -> Optional[str]:
-    """
-    Find the first valid ISBN-13 sequence in a noisy scan string.
-    Handles '978... 51299' (price add-on), '978...+51299', etc.
-    """
     if not s:
         return None
     candidates = re.findall(r"\d{13}", s)
-    # Prioritize 978/979
     candidates = sorted(candidates, key=lambda x: (not x.startswith(("978", "979")),))
     for c in candidates:
         if validate_isbn13(c):
@@ -223,7 +219,7 @@ def decode_isbn_from_image(image_bytes: bytes) -> Optional[str]:
         return None
 
 # -----------------------------
-# Lookups
+# API lookups
 # -----------------------------
 def _google_books_query(q: str, api_key: Optional[str] = None):
     params = {"q": q, "maxResults": 1, "printType": "books"}
@@ -249,13 +245,10 @@ def _google_books_query(q: str, api_key: Optional[str] = None):
     }
 
 def google_books_lookup_by_isbn_any(isbn: str, api_key: Optional[str] = None):
-    # 1) canonical isbn: query
     rec = _google_books_query(f"isbn:{isbn}", api_key)
     if rec:
         rec["isbn"] = isbn
         return rec
-
-    # 2) if 978* and valid, also try ISBN-10
     if isbn.isdigit() and len(isbn) == 13 and isbn.startswith("978"):
         alt10 = isbn13_to_isbn10(isbn)
         if alt10:
@@ -263,21 +256,12 @@ def google_books_lookup_by_isbn_any(isbn: str, api_key: Optional[str] = None):
             if rec:
                 rec["isbn"] = isbn
                 return rec
-
-    # 3) plain numeric search (some entries aren't indexed under isbn:)
-    rec = _google_books_query(isbn, api_key)
+    # extra attempts
+    rec = _google_books_query(isbn, api_key) or _google_books_query(f'"{isbn}"', api_key)
     if rec:
         rec["isbn"] = isbn
         return rec
-
-    # 4) quoted exact search
-    rec = _google_books_query(f'"{isbn}"', api_key)
-    if rec:
-        rec["isbn"] = isbn
-        return rec
-
     return None
-
 
 def openlibrary_lookup_by_isbn(isbn: str):
     try:
@@ -293,7 +277,6 @@ def openlibrary_lookup_by_isbn(isbn: str):
                 ar = requests.get(f"https://openlibrary.org{key}.json", timeout=10)
                 if ar.ok:
                     authors.append(ar.json().get("name", ""))
-        # try extra fields
         page_count = data.get("number_of_pages") or 0
         published_date = data.get("publish_date", "")
         publishers = data.get("publishers", [])
@@ -313,8 +296,220 @@ def openlibrary_lookup_by_isbn(isbn: str):
     except Exception:
         return None
 
-def lookup_book_by_isbn_robust(isbn_raw: str):
-    """Clean, validate & try Google Books (13/10) then OpenLibrary."""
+def isbndb_lookup(isbn: str):
+    if not ISBNDB_KEY:
+        return None
+    try:
+        r = requests.get(
+            f"https://api2.isbndb.com/book/{isbn}",
+            headers={"X-API-Key": ISBNDB_KEY},
+            timeout=10
+        )
+        if not r.ok:
+            return None
+        data = r.json().get("book", {})
+        return {
+            "isbn": isbn,
+            "title": data.get("title", ""),
+            "author": ", ".join(data.get("authors", []) or []),
+            "publisher": data.get("publisher", ""),
+            "language": data.get("language", ""),
+            "page_count": data.get("pages", 0),
+            "published_date": data.get("date_published", ""),
+            "thumbnail": data.get("image", ""),
+            "categories": ", ".join(data.get("subjects", []) or []),
+            "description": data.get("overview", ""),
+        }
+    except Exception:
+        return None
+
+# -----------------------------
+# WEB FALLBACK SCRAPERS (Adlibris, Saxo, iMusic)
+# -----------------------------
+HEADERS_HTTP = {
+    "User-Agent": "Mozilla/5.0 (compatible; BookLogger/1.0; +https://streamlit.app)"
+}
+
+def _soup(url: str):
+    try:
+        r = requests.get(url, headers=HEADERS_HTTP, timeout=10)
+        if not r.ok:
+            return None
+        return BeautifulSoup(r.text, "html.parser")
+    except Exception:
+        return None
+
+def scrape_adlibris(isbn: str) -> Optional[dict]:
+    # Try product-by-ISBN search pages (Nordic locales)
+    urls = [
+        f"https://www.adlibris.com/se/sok?q={isbn}",
+        f"https://www.adlibris.com/dk/sog?q={isbn}",
+        f"https://www.adlibris.com/no/sok?q={isbn}",
+        f"https://www.adlibris.com/fi/haku?q={isbn}",
+    ]
+    for u in urls:
+        soup = _soup(u)
+        if not soup:
+            continue
+        # Heuristic: follow first product link on search results
+        a = soup.select_one('a[href*="/product/"], a[href*="/bok/"], a[href*="/bog/"]')
+        if a and a.get("href"):
+            prod = a["href"]
+            if prod.startswith("/"):
+                base = u.split("/")[0] + "//" + u.split("/")[2]
+                u2 = base + prod
+            else:
+                u2 = prod
+            soup = _soup(u2)
+            if not soup:
+                continue
+
+        # Pull open-graph meta first
+        title = (soup.select_one('meta[property="og:title"]') or {}).get("content", "")
+        image = (soup.select_one('meta[property="og:image"]') or {}).get("content", "")
+        # Try to find author/publisher/pages in common info blocks
+        author = ""
+        publisher = ""
+        lang = ""
+        pages = 0
+        # Simple heuristics (these sites change often; we keep it resilient)
+        text = soup.get_text(" ", strip=True)
+        # pages
+        m = re.search(r"(\d{2,4})\s+(sider|sider|sidor|pages)", text, re.IGNORECASE)
+        if m:
+            try:
+                pages = int(m.group(1))
+            except Exception:
+                pages = 0
+        # language
+        m = re.search(r"(språk|sprog|language)\s*[:\-]?\s*([A-Za-zæøåÄÖÅÉÍÓÚáéíóúñ\-]+)", text, re.IGNORECASE)
+        if m:
+            lang = m.group(2)
+        # publisher (Förlag/Forlag/Forlag)
+        m = re.search(r"(förlag|forlag|publisher)\s*[:\-]?\s*([A-Za-z0-9 .,&\-’'ÆØÅæøåÉé]+)", text, re.IGNORECASE)
+        if m:
+            publisher = m.group(2).strip(" .,-")
+
+        return {
+            "isbn": isbn,
+            "title": title,
+            "author": author,     # often in page header; hard to parse reliably; leave blank
+            "thumbnail": image,
+            "page_count": pages,
+            "published_date": "",
+            "publisher": publisher,
+            "categories": "",
+            "language": lang,
+            "description": "",
+        }
+    return None
+
+def scrape_saxo(isbn: str) -> Optional[dict]:
+    # Danish retailer
+    url = f"https://www.saxo.com/dk/s?q={isbn}"
+    soup = _soup(url)
+    if not soup:
+        return None
+    # First product card
+    a = soup.select_one('a[href*="/bog/"], a[href*="/bog-p"]:not([href*="s?q="])')
+    if a and a.get("href"):
+        prod_url = "https://www.saxo.com" + a["href"] if a["href"].startswith("/") else a["href"]
+        soup = _soup(prod_url)
+        if not soup:
+            return None
+    title = (soup.select_one('meta[property="og:title"]') or {}).get("content", "")
+    image = (soup.select_one('meta[property="og:image"]') or {}).get("content", "")
+    text = soup.get_text(" ", strip=True)
+    pages = 0
+    m = re.search(r"(\d{2,4})\s+(sider|pages)", text, re.IGNORECASE)
+    if m:
+        try:
+            pages = int(m.group(1))
+        except Exception:
+            pass
+    publisher = ""
+    m = re.search(r"(Forlag|Publisher)\s*[:\-]?\s*([A-Za-z0-9 .,&\-’'ÆØÅæøåÉé]+)", text, re.IGNORECASE)
+    if m:
+        publisher = m.group(2).strip(" .,-")
+    # author heuristics
+    author = ""
+    h1 = soup.select_one("h1")
+    if h1:
+        # often "Title - Forfatter: Name"
+        m = re.search(r"[-–]\s*(?:af|forfatter)\s*:\s*(.+)$", h1.get_text(strip=True), re.IGNORECASE)
+        if m:
+            author = m.group(1)
+
+    return {
+        "isbn": isbn,
+        "title": title,
+        "author": author,
+        "thumbnail": image,
+        "page_count": pages,
+        "published_date": "",
+        "publisher": publisher,
+        "categories": "",
+        "language": "",
+        "description": "",
+    }
+
+def scrape_imusic(isbn: str) -> Optional[dict]:
+    # iMusic also lists books
+    url = f"https://www.imusic.dk/search?type=book&q={isbn}"
+    soup = _soup(url)
+    if not soup:
+        return None
+    a = soup.select_one('a[href*="/books/"], a[href*="/bog/"], a[href*="/book/"]')
+    if a and a.get("href"):
+        prod = a["href"]
+        prod_url = "https://www.imusic.dk" + prod if prod.startswith("/") else prod
+        soup = _soup(prod_url)
+        if not soup:
+            return None
+    title = (soup.select_one('meta[property="og:title"]') or {}).get("content", "")
+    image = (soup.select_one('meta[property="og:image"]') or {}).get("content", "")
+    text = soup.get_text(" ", strip=True)
+    pages = 0
+    m = re.search(r"(\d{2,4})\s+(sider|pages)", text, re.IGNORECASE)
+    if m:
+        try:
+            pages = int(m.group(1))
+        except Exception:
+            pass
+    publisher = ""
+    m = re.search(r"(Forlag|Publisher)\s*[:\-]?\s*([A-Za-z0-9 .,&\-’'ÆØÅæøåÉé]+)", text, re.IGNORECASE)
+    if m:
+        publisher = m.group(2).strip(" .,-")
+
+    return {
+        "isbn": isbn,
+        "title": title,
+        "author": "",
+        "thumbnail": image,
+        "page_count": pages,
+        "published_date": "",
+        "publisher": publisher,
+        "categories": "",
+        "language": "",
+        "description": "",
+    }
+
+def web_fallback_scrape(isbn: str) -> Optional[dict]:
+    """
+    Try a few reputable Nordic retailers by ISBN.
+    NOTE: Be respectful of site terms and request volume.
+    """
+    for fn in (scrape_adlibris, scrape_saxo, scrape_imusic):
+        rec = fn(isbn)
+        if rec and (rec.get("title") or rec.get("thumbnail") or rec.get("publisher")):
+            return rec
+    return None
+
+# -----------------------------
+# HYBRID LOOKUP (APIs → web fallback)
+# -----------------------------
+def lookup_book_by_isbn_hybrid(isbn_raw: str):
+    """Clean, validate, then try Google → ISBNdb (if key) → OpenLibrary → web scraping."""
     if not isbn_raw:
         return None
     s = isbn_raw.strip()
@@ -328,27 +523,36 @@ def lookup_book_by_isbn_robust(isbn_raw: str):
     if len(s) not in (10, 13):
         return None
 
+    # 1) Google Books
     rec = google_books_lookup_by_isbn_any(s, API_KEY or None)
     if rec:
-        if "isbn" not in rec:
-            rec["isbn"] = s
-        # Ensure all keys exist
-        for k in ["page_count", "published_date", "publisher", "categories", "language", "description"]:
-            rec.setdefault(k, "" if k != "page_count" else 0)
+        rec["isbn"] = s
         return rec
 
+    # 2) ISBNdb (optional)
+    rec = isbndb_lookup(s)
+    if rec:
+        return rec
+
+    # 3) OpenLibrary
     rec = openlibrary_lookup_by_isbn(s)
     if rec:
         return rec
-    if len(s) == 13:
-        alt10 = isbn13_to_isbn10(s)
-        if alt10 and validate_isbn10(alt10):
-            rec = openlibrary_lookup_by_isbn(alt10)
-            if rec:
-                rec["isbn"] = s
-                return rec
+
+    # 4) Web fallback scrape
+    rec = web_fallback_scrape(s)
+    if rec:
+        # If scraping gave only partial info, try to enrich via APIs again (cheap no-ops if missing)
+        enrich = google_books_lookup_by_isbn_any(s, API_KEY or None) or openlibrary_lookup_by_isbn(s)
+        if enrich:
+            rec = merge_meta(rec, enrich)
+        return rec
+
     return None
 
+# -----------------------------
+# Search (unchanged)
+# -----------------------------
 def google_books_search(query: str, limit=12):
     params = {"q": query, "maxResults": limit, "printType": "books"}
     if API_KEY:
@@ -382,7 +586,7 @@ def google_books_search(query: str, limit=12):
 # -----------------------------
 # UI — Add books
 # -----------------------------
-st.title("📚 Karlas Book Logger")
+st.title("📚 Simple Book Logger")
 
 with st.expander("➕ Add a book", expanded=True):
     tab_scan, tab_search, tab_manual = st.tabs(["📷 Scan ISBN", "🔎 Search", "✍️ Manual"])
@@ -395,7 +599,7 @@ with st.expander("➕ Add a book", expanded=True):
             if isbn:
                 st.success(f"Scanned ISBN: {isbn}")
                 with st.spinner("Looking up book details..."):
-                    meta = lookup_book_by_isbn_robust(isbn)
+                    meta = lookup_book_by_isbn_hybrid(isbn)
                 if meta:
                     c1, c2 = st.columns([1, 2])
                     with c1:
@@ -410,7 +614,7 @@ with st.expander("➕ Add a book", expanded=True):
                         rating = st.slider("Rating", 0, 5, 0, key="scan_rating")
                         status = st.selectbox("Status", STATUS_OPTIONS, index=0, key="scan_status")
                         d = st.date_input("Date (optional)", value=None, format="YYYY-MM-DD", key="scan_date")
-                        # show extra metadata (editable)
+                        # editable metadata
                         m_pages = st.number_input("Pages", min_value=0, step=1, value=int(meta.get("page_count") or 0))
                         m_pubdate = st.text_input("Published date", value=meta.get("published_date", ""))
                         m_publisher = st.text_input("Publisher", value=meta.get("publisher", ""))
@@ -420,7 +624,7 @@ with st.expander("➕ Add a book", expanded=True):
                         notes = st.text_area("Your Notes", key="scan_notes")
                         if st.button("Add to library", type="primary"):
                             add_row({
-                                "isbn": meta.get("isbn", ""),
+                                "isbn": meta.get("isbn", isbn),
                                 "title": meta.get("title", ""),
                                 "author": meta.get("author", ""),
                                 "rating": int(rating),
@@ -495,14 +699,15 @@ with st.expander("➕ Add a book", expanded=True):
         with col_l:
             if st.button("Lookup ISBN"):
                 with st.spinner("Looking up..."):
-                    meta = lookup_book_by_isbn_robust(isbn_input)
+                    meta = lookup_book_by_isbn_hybrid(isbn_input)
                 if meta:
                     st.session_state["manual_prefill"] = meta
                     st.success("Found book! Prefilled below.")
                 else:
-                    st.warning("No book found for that ISBN.")
+                    st.session_state["manual_prefill"] = {"isbn": clean_isbn(isbn_input)}
+                    st.info("No API/web result. Prefilled the form with the ISBN so you can enter details manually.")
         with col_r:
-            st.caption("Tip: Works with 13-digit ISBN best. If it fails, try removing spaces/dashes.")
+            st.caption("Tip: Works best with 13-digit ISBN. Remove spaces/dashes if needed.")
 
         st.markdown("#### B) Manual add / edit fields")
         pre = st.session_state.get("manual_prefill", {})
@@ -676,7 +881,7 @@ st.download_button(
 st.divider()
 
 # -----------------------------
-# ADMIN: Edit all entries (optional manual edit of the Sheet)
+# ADMIN: Edit all entries (sheet view)
 # -----------------------------
 st.subheader("✏️ Edit all entries (sheet view)")
 
@@ -686,7 +891,6 @@ with st.expander("Current entries (read-only preview)"):
 st.caption("You can edit the table below and click **Save changes** to update the Google Sheet.")
 editable = df.copy()
 
-# Use TextArea for long description
 try:
     desc_col = st.column_config.TextAreaColumn("description")
 except Exception:
@@ -722,8 +926,6 @@ c1, c2 = st.columns([1, 3])
 with c1:
     if st.button("Save changes", type="primary"):
         ed = normalize_columns(edited.copy())
-
-        # Check ids unique & nonzero
         if ed["id"].duplicated().any():
             st.error("Duplicate ids found. Make sure each row has a unique 'id'.")
         else:
