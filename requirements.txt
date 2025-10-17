@@ -1,0 +1,8 @@
+streamlit
+gspread
+gspread-dataframe
+google-auth
+requests
+pandas
+pillow
+zxing-cpp
