@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "beautifulsoup4>=4.14.2",
     "google-auth>=2.41.1",
     "gspread>=6.2.1",
     "gspread-dataframe>=4.0.0",
