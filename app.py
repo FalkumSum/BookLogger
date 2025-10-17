@@ -365,7 +365,7 @@ def google_books_search(query: str, limit=12):
 # -----------------------------
 # UI — Add books
 # -----------------------------
-st.title("📚 Simple Book Logger")
+st.title("📚 Karlas Book Logger")
 
 with st.expander("➕ Add a book", expanded=True):
     tab_scan, tab_search, tab_manual = st.tabs(["📷 Scan ISBN", "🔎 Search", "✍️ Manual"])
