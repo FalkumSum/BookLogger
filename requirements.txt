@@ -7,3 +7,4 @@ pandas
 pillow
 zxing-cpp
 beautifulsoup4
+google-cloud-vision

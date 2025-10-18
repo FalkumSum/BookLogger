@@ -1,669 +1,238 @@
-import io
-import re
-from datetime import datetime, date
-from typing import List, Optional
-
-import pandas as pd
-import requests
 import streamlit as st
-from PIL import Image
+from datetime import date, datetime
+import pandas as pd
 
-import gspread
-from google.oauth2.service_account import Credentials
-from gspread_dataframe import get_as_dataframe, set_with_dataframe
+from src.models import Book, STATUS_OPTIONS
+from src.utils import safe_url
+from src.repository import read_all, write_all, add_book, delete_ids
+from src.services import BookLookupService
+from src import ocr as ocrmod
 
-# NEW: for web fallback scraping
-from bs4 import BeautifulSoup
-
-# Try zxing-cpp for barcode decoding (works on Streamlit Cloud)
-ZXING_READY = True
-try:
-    import zxingcpp
-except Exception:
-    ZXING_READY = False
+from src.barcode import decode_isbn
 
 st.set_page_config(page_title="Book Logger", page_icon="📚", layout="wide")
 
-# -----------------------------
-# Config / Secrets
-# -----------------------------
-SCOPE = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-]
-SECRETS = st.secrets
-
+# Secrets guard
 def require_secret(section: str, key: str, example: str = ""):
-    if section not in SECRETS:
-        st.error(f"Missing secrets section: [{section}] in secrets.toml")
-        if example:
-            st.code(example, language="toml")
-        st.stop()
-    if key not in SECRETS[section]:
-        st.error(f"Missing secret: [{section}].{key} in secrets.toml")
-        if example:
-            st.code(example, language="toml")
-        st.stop()
-    return SECRETS[section][key]
+    if section not in st.secrets:
+        st.error(f"Missing secrets section: [{section}]"); 
+        if example: st.code(example, language="toml"); st.stop()
+    if key not in st.secrets[section]:
+        st.error(f"Missing secret: [{section}].{key}"); 
+        if example: st.code(example, language="toml"); st.stop()
+    return st.secrets[section][key]
 
-SHEET_NAME = require_secret("sheet", "name", example='[sheet]\nname = "book_logger"\nworksheet = "books"')
-WORKSHEET_NAME = require_secret("sheet", "worksheet")
-API_KEY = SECRETS.get("google_books", {}).get("api_key", "")
+require_secret("sheet", "name", example='[sheet]\nname = "book_logger"\nworksheet = "books"')
+require_secret("sheet", "worksheet")
 
-# Optional: ISBNdb (if you want extra coverage; not required)
-ISBNDB_KEY = SECRETS.get("isbndb", {}).get("api_key", "")
+GOOGLE_KEY = st.secrets.get("google_books", {}).get("api_key", "")
+ISBNDB_KEY = st.secrets.get("isbndb", {}).get("api_key", "")
 
-# Base schema
-HEADERS = [
-    "id", "isbn", "title", "author", "rating", "notes", "thumbnail",
-    "status", "date", "added_at",
-    "page_count", "published_date", "publisher", "categories", "language", "description"
-]
-STATUS_OPTIONS = ["Wishlist", "Reading", "Finished"]
+svc = BookLookupService(google_api_key=GOOGLE_KEY, isbndb_key=ISBNDB_KEY)
 
-# -----------------------------
-# Small helpers
-# -----------------------------
-def safe_url(u):
-    if isinstance(u, str):
-        u = u.strip()
-        if u.lower().startswith(("http://", "https://")) and len(u) > 7:
-            return u
-    return None
-
-def coerce_string(df: pd.DataFrame, cols: List[str]):
-    for c in cols:
-        if c in df.columns:
-            df[c] = df[c].astype("string").fillna("")
-            df[c] = df[c].replace("nan", "")
-
-def merge_meta(base: dict, extra: dict) -> dict:
-    """Fill missing fields in base with values from extra."""
-    merged = base.copy()
-    for k, v in extra.items():
-        if not merged.get(k) and v not in (None, "", 0):
-            merged[k] = v
-    return merged
-
-# -----------------------------
-# Google Sheets helpers
-# -----------------------------
-@st.cache_resource
-def get_ws():
-    creds = Credentials.from_service_account_info(dict(SECRETS["gcp_service_account"]), scopes=SCOPE)
-    gc = gspread.authorize(creds)
-    sh = gc.open(SHEET_NAME)
-    try:
-        ws = sh.worksheet(WORKSHEET_NAME)
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(WORKSHEET_NAME, rows=800, cols=30)
-        ws.append_row(HEADERS)
-    return ws
-
-def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        df = pd.DataFrame(columns=HEADERS)
-    for col in HEADERS:
-        if col not in df.columns:
-            df[col] = "" if col not in ("rating", "id", "page_count") else 0
-
-    df["id"] = pd.to_numeric(df["id"], errors="ignore")
-    df["id"] = pd.to_numeric(df["id"], errors="coerce").fillna(0).astype(int)
-    df["rating"] = pd.to_numeric(df["rating"], errors="coerce").fillna(0).astype(int).clip(0, 5)
-    df["page_count"] = pd.to_numeric(df["page_count"], errors="coerce").fillna(0).astype(int)
-
-    str_cols = [
-        "isbn", "title", "author", "notes", "thumbnail",
-        "status", "date", "added_at",
-        "published_date", "publisher", "categories", "language", "description"
-    ]
-    coerce_string(df, str_cols)
-    df["status"] = df["status"].replace("", "Wishlist")
-    return df[HEADERS]
-
-def read_df() -> pd.DataFrame:
-    df = get_as_dataframe(get_ws(), header=0, evaluate_formulas=True).dropna(how="all")
-    return normalize_columns(df)
-
-def write_df(df: pd.DataFrame):
-    ws = get_ws()
-    ws.clear()
-    set_with_dataframe(ws, df[HEADERS])
-
-def next_id(df: pd.DataFrame) -> int:
-    return 1 if df.empty else int(pd.to_numeric(df["id"], errors="coerce").fillna(0).max()) + 1
-
-def add_row(row: dict):
-    df = read_df()
-    row.setdefault("id", next_id(df))
-    row.setdefault("added_at", datetime.now().isoformat(timespec="seconds"))
-    row.setdefault("status", "Wishlist")
-    row.setdefault("date", "")
-    row.setdefault("rating", 0)
-    row.setdefault("page_count", 0)
-    row.setdefault("published_date", "")
-    row.setdefault("publisher", "")
-    row.setdefault("categories", "")
-    row.setdefault("language", "")
-    row.setdefault("description", "")
-    df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-    write_df(normalize_columns(df))
-
-def delete_rows(ids: List[int]):
-    df = read_df()
-    df = df[~df["id"].isin(ids)]
-    write_df(normalize_columns(df))
-
-# -----------------------------
-# ISBN utils
-# -----------------------------
-def clean_isbn(s: str) -> str:
-    return re.sub(r"[^0-9X]", "", (s or "").upper())
-
-def validate_isbn13(isbn13: str) -> bool:
-    if not (isbn13.isdigit() and len(isbn13) == 13):
-        return False
-    total = sum((int(d) * (1 if i % 2 == 0 else 3)) for i, d in enumerate(isbn13[:12]))
-    check = (10 - (total % 10)) % 10
-    return check == int(isbn13[-1])
-
-def validate_isbn10(isbn10: str) -> bool:
-    if len(isbn10) != 10:
-        return False
-    total = 0
-    for i, ch in enumerate(isbn10[:9], start=1):
-        if not ch.isdigit():
-            return False
-        total += i * int(ch)
-    check = total % 11
-    last = isbn10[-1]
-    return (last == "X" and check == 10) or (last.isdigit() and check == int(last))
-
-def isbn13_to_isbn10(isbn13: str) -> Optional[str]:
-    if not (isbn13.startswith("978") and validate_isbn13(isbn13)):
-        return None
-    core = isbn13[3:12]
-    total = sum((i + 1) * int(d) for i, d in enumerate(core))
-    remainder = total % 11
-    check = "X" if remainder == 10 else str(remainder)
-    return core + check
-
-def extract_isbn13_from_text(s: str) -> Optional[str]:
-    if not s:
-        return None
-    candidates = re.findall(r"\d{13}", s)
-    candidates = sorted(candidates, key=lambda x: (not x.startswith(("978", "979")),))
-    for c in candidates:
-        if validate_isbn13(c):
-            return c
-    return None
-
-# -----------------------------
-# Barcode decoding
-# -----------------------------
-def decode_isbn_from_image(image_bytes: bytes) -> Optional[str]:
-    if not ZXING_READY:
-        return None
-    try:
-        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        results = zxingcpp.read_barcodes(img)
-        for res in results:
-            raw = (res.text or "").strip()
-            if raw.isdigit() and len(raw) == 13 and validate_isbn13(raw):
-                return raw
-            found = extract_isbn13_from_text(raw)
-            if found:
-                return found
-        return None
-    except Exception:
-        return None
-
-# -----------------------------
-# API lookups
-# -----------------------------
-def _google_books_query(q: str, api_key: Optional[str] = None):
-    params = {"q": q, "maxResults": 1, "printType": "books"}
-    if api_key:
-        params["key"] = api_key
-    r = requests.get("https://www.googleapis.com/books/v1/volumes", params=params, timeout=10)
-    if not r.ok:
-        return None
-    items = r.json().get("items", [])
-    if not items:
-        return None
-    info = items[0].get("volumeInfo", {})
-    return {
-        "title": info.get("title", ""),
-        "author": ", ".join(info.get("authors", []) or []),
-        "thumbnail": (info.get("imageLinks", {}) or {}).get("thumbnail", ""),
-        "page_count": info.get("pageCount") or 0,
-        "published_date": info.get("publishedDate", ""),
-        "publisher": info.get("publisher", ""),
-        "categories": ", ".join(info.get("categories", []) or []),
-        "language": info.get("language", ""),
-        "description": info.get("description", ""),
-    }
-
-def google_books_lookup_by_isbn_any(isbn: str, api_key: Optional[str] = None):
-    rec = _google_books_query(f"isbn:{isbn}", api_key)
-    if rec:
-        rec["isbn"] = isbn
-        return rec
-    if isbn.isdigit() and len(isbn) == 13 and isbn.startswith("978"):
-        alt10 = isbn13_to_isbn10(isbn)
-        if alt10:
-            rec = _google_books_query(f"isbn:{alt10}", api_key)
-            if rec:
-                rec["isbn"] = isbn
-                return rec
-    # extra attempts
-    rec = _google_books_query(isbn, api_key) or _google_books_query(f'"{isbn}"', api_key)
-    if rec:
-        rec["isbn"] = isbn
-        return rec
-    return None
-
-def openlibrary_lookup_by_isbn(isbn: str):
-    try:
-        r = requests.get(f"https://openlibrary.org/isbn/{isbn}.json", timeout=10)
-        if not r.ok:
-            return None
-        data = r.json()
-        title = data.get("title", "")
-        authors = []
-        for a in data.get("authors", []):
-            key = a.get("key")
-            if key:
-                ar = requests.get(f"https://openlibrary.org{key}.json", timeout=10)
-                if ar.ok:
-                    authors.append(ar.json().get("name", ""))
-        page_count = data.get("number_of_pages") or 0
-        published_date = data.get("publish_date", "")
-        publishers = data.get("publishers", [])
-        publisher = ", ".join(publishers) if isinstance(publishers, list) else (publishers or "")
-        return {
-            "isbn": isbn,
-            "title": title,
-            "author": ", ".join([a for a in authors if a]),
-            "thumbnail": "",
-            "page_count": page_count,
-            "published_date": published_date,
-            "publisher": publisher,
-            "categories": "",
-            "language": "",
-            "description": "",
-        }
-    except Exception:
-        return None
-
-def isbndb_lookup(isbn: str):
-    if not ISBNDB_KEY:
-        return None
-    try:
-        r = requests.get(
-            f"https://api2.isbndb.com/book/{isbn}",
-            headers={"X-API-Key": ISBNDB_KEY},
-            timeout=10
-        )
-        if not r.ok:
-            return None
-        data = r.json().get("book", {})
-        return {
-            "isbn": isbn,
-            "title": data.get("title", ""),
-            "author": ", ".join(data.get("authors", []) or []),
-            "publisher": data.get("publisher", ""),
-            "language": data.get("language", ""),
-            "page_count": data.get("pages", 0),
-            "published_date": data.get("date_published", ""),
-            "thumbnail": data.get("image", ""),
-            "categories": ", ".join(data.get("subjects", []) or []),
-            "description": data.get("overview", ""),
-        }
-    except Exception:
-        return None
-
-# -----------------------------
-# WEB FALLBACK SCRAPERS (Adlibris, Saxo, iMusic)
-# -----------------------------
-HEADERS_HTTP = {
-    "User-Agent": "Mozilla/5.0 (compatible; BookLogger/1.0; +https://streamlit.app)"
-}
-
-def _soup(url: str):
-    try:
-        r = requests.get(url, headers=HEADERS_HTTP, timeout=10)
-        if not r.ok:
-            return None
-        return BeautifulSoup(r.text, "html.parser")
-    except Exception:
-        return None
-
-def scrape_adlibris(isbn: str) -> Optional[dict]:
-    # Try product-by-ISBN search pages (Nordic locales)
-    urls = [
-        f"https://www.adlibris.com/se/sok?q={isbn}",
-        f"https://www.adlibris.com/dk/sog?q={isbn}",
-        f"https://www.adlibris.com/no/sok?q={isbn}",
-        f"https://www.adlibris.com/fi/haku?q={isbn}",
-    ]
-    for u in urls:
-        soup = _soup(u)
-        if not soup:
-            continue
-        # Heuristic: follow first product link on search results
-        a = soup.select_one('a[href*="/product/"], a[href*="/bok/"], a[href*="/bog/"]')
-        if a and a.get("href"):
-            prod = a["href"]
-            if prod.startswith("/"):
-                base = u.split("/")[0] + "//" + u.split("/")[2]
-                u2 = base + prod
-            else:
-                u2 = prod
-            soup = _soup(u2)
-            if not soup:
-                continue
-
-        # Pull open-graph meta first
-        title = (soup.select_one('meta[property="og:title"]') or {}).get("content", "")
-        image = (soup.select_one('meta[property="og:image"]') or {}).get("content", "")
-        # Try to find author/publisher/pages in common info blocks
-        author = ""
-        publisher = ""
-        lang = ""
-        pages = 0
-        # Simple heuristics (these sites change often; we keep it resilient)
-        text = soup.get_text(" ", strip=True)
-        # pages
-        m = re.search(r"(\d{2,4})\s+(sider|sider|sidor|pages)", text, re.IGNORECASE)
-        if m:
-            try:
-                pages = int(m.group(1))
-            except Exception:
-                pages = 0
-        # language
-        m = re.search(r"(språk|sprog|language)\s*[:\-]?\s*([A-Za-zæøåÄÖÅÉÍÓÚáéíóúñ\-]+)", text, re.IGNORECASE)
-        if m:
-            lang = m.group(2)
-        # publisher (Förlag/Forlag/Forlag)
-        m = re.search(r"(förlag|forlag|publisher)\s*[:\-]?\s*([A-Za-z0-9 .,&\-’'ÆØÅæøåÉé]+)", text, re.IGNORECASE)
-        if m:
-            publisher = m.group(2).strip(" .,-")
-
-        return {
-            "isbn": isbn,
-            "title": title,
-            "author": author,     # often in page header; hard to parse reliably; leave blank
-            "thumbnail": image,
-            "page_count": pages,
-            "published_date": "",
-            "publisher": publisher,
-            "categories": "",
-            "language": lang,
-            "description": "",
-        }
-    return None
-
-def scrape_saxo(isbn: str) -> Optional[dict]:
-    # Danish retailer
-    url = f"https://www.saxo.com/dk/s?q={isbn}"
-    soup = _soup(url)
-    if not soup:
-        return None
-    # First product card
-    a = soup.select_one('a[href*="/bog/"], a[href*="/bog-p"]:not([href*="s?q="])')
-    if a and a.get("href"):
-        prod_url = "https://www.saxo.com" + a["href"] if a["href"].startswith("/") else a["href"]
-        soup = _soup(prod_url)
-        if not soup:
-            return None
-    title = (soup.select_one('meta[property="og:title"]') or {}).get("content", "")
-    image = (soup.select_one('meta[property="og:image"]') or {}).get("content", "")
-    text = soup.get_text(" ", strip=True)
-    pages = 0
-    m = re.search(r"(\d{2,4})\s+(sider|pages)", text, re.IGNORECASE)
-    if m:
-        try:
-            pages = int(m.group(1))
-        except Exception:
-            pass
-    publisher = ""
-    m = re.search(r"(Forlag|Publisher)\s*[:\-]?\s*([A-Za-z0-9 .,&\-’'ÆØÅæøåÉé]+)", text, re.IGNORECASE)
-    if m:
-        publisher = m.group(2).strip(" .,-")
-    # author heuristics
-    author = ""
-    h1 = soup.select_one("h1")
-    if h1:
-        # often "Title - Forfatter: Name"
-        m = re.search(r"[-–]\s*(?:af|forfatter)\s*:\s*(.+)$", h1.get_text(strip=True), re.IGNORECASE)
-        if m:
-            author = m.group(1)
-
-    return {
-        "isbn": isbn,
-        "title": title,
-        "author": author,
-        "thumbnail": image,
-        "page_count": pages,
-        "published_date": "",
-        "publisher": publisher,
-        "categories": "",
-        "language": "",
-        "description": "",
-    }
-
-def scrape_imusic(isbn: str) -> Optional[dict]:
-    # iMusic also lists books
-    url = f"https://www.imusic.dk/search?type=book&q={isbn}"
-    soup = _soup(url)
-    if not soup:
-        return None
-    a = soup.select_one('a[href*="/books/"], a[href*="/bog/"], a[href*="/book/"]')
-    if a and a.get("href"):
-        prod = a["href"]
-        prod_url = "https://www.imusic.dk" + prod if prod.startswith("/") else prod
-        soup = _soup(prod_url)
-        if not soup:
-            return None
-    title = (soup.select_one('meta[property="og:title"]') or {}).get("content", "")
-    image = (soup.select_one('meta[property="og:image"]') or {}).get("content", "")
-    text = soup.get_text(" ", strip=True)
-    pages = 0
-    m = re.search(r"(\d{2,4})\s+(sider|pages)", text, re.IGNORECASE)
-    if m:
-        try:
-            pages = int(m.group(1))
-        except Exception:
-            pass
-    publisher = ""
-    m = re.search(r"(Forlag|Publisher)\s*[:\-]?\s*([A-Za-z0-9 .,&\-’'ÆØÅæøåÉé]+)", text, re.IGNORECASE)
-    if m:
-        publisher = m.group(2).strip(" .,-")
-
-    return {
-        "isbn": isbn,
-        "title": title,
-        "author": "",
-        "thumbnail": image,
-        "page_count": pages,
-        "published_date": "",
-        "publisher": publisher,
-        "categories": "",
-        "language": "",
-        "description": "",
-    }
-
-def web_fallback_scrape(isbn: str) -> Optional[dict]:
-    """
-    Try a few reputable Nordic retailers by ISBN.
-    NOTE: Be respectful of site terms and request volume.
-    """
-    for fn in (scrape_adlibris, scrape_saxo, scrape_imusic):
-        rec = fn(isbn)
-        if rec and (rec.get("title") or rec.get("thumbnail") or rec.get("publisher")):
-            return rec
-    return None
-
-# -----------------------------
-# HYBRID LOOKUP (APIs → web fallback)
-# -----------------------------
-def lookup_book_by_isbn_hybrid(isbn_raw: str):
-    """Clean, validate, then try Google → ISBNdb (if key) → OpenLibrary → web scraping."""
-    if not isbn_raw:
-        return None
-    s = isbn_raw.strip()
-    if not (s.isdigit() and len(s) in (10, 13)):
-        found = extract_isbn13_from_text(s)
-        if found:
-            s = found
-    s = clean_isbn(s)
-    if len(s) == 13 and not validate_isbn13(s):
-        return None
-    if len(s) not in (10, 13):
-        return None
-
-    # 1) Google Books
-    rec = google_books_lookup_by_isbn_any(s, API_KEY or None)
-    if rec:
-        rec["isbn"] = s
-        return rec
-
-    # 2) ISBNdb (optional)
-    rec = isbndb_lookup(s)
-    if rec:
-        return rec
-
-    # 3) OpenLibrary
-    rec = openlibrary_lookup_by_isbn(s)
-    if rec:
-        return rec
-
-    # 4) Web fallback scrape
-    rec = web_fallback_scrape(s)
-    if rec:
-        # If scraping gave only partial info, try to enrich via APIs again (cheap no-ops if missing)
-        enrich = google_books_lookup_by_isbn_any(s, API_KEY or None) or openlibrary_lookup_by_isbn(s)
-        if enrich:
-            rec = merge_meta(rec, enrich)
-        return rec
-
-    return None
-
-# -----------------------------
-# Search (unchanged)
-# -----------------------------
-def google_books_search(query: str, limit=12):
-    params = {"q": query, "maxResults": limit, "printType": "books"}
-    if API_KEY:
-        params["key"] = API_KEY
-    r = requests.get("https://www.googleapis.com/books/v1/volumes", params=params, timeout=10)
-    r.raise_for_status()
-    out = []
-    for it in r.json().get("items", []):
-        info = it.get("volumeInfo", {})
-        ids = info.get("industryIdentifiers", []) or []
-        isbn = ""
-        for ident in ids:
-            if ident.get("type") in ("ISBN_13", "ISBN_10"):
-                isbn = ident.get("identifier", "")
-                break
-        out.append({
-            "id": it.get("id"),
-            "title": info.get("title", ""),
-            "author": ", ".join(info.get("authors", []) or []),
-            "thumbnail": (info.get("imageLinks", {}) or {}).get("thumbnail", ""),
-            "isbn": isbn,
-            "page_count": info.get("pageCount") or 0,
-            "published_date": info.get("publishedDate", ""),
-            "publisher": info.get("publisher", ""),
-            "categories": ", ".join(info.get("categories", []) or []),
-            "language": info.get("language", ""),
-            "description": info.get("description", ""),
-        })
-    return out
-
-# -----------------------------
-# UI — Add books
-# -----------------------------
-st.title("📚 Simple Book Logger")
+st.title("📚 Simple Book Logger (modular)")
 
 with st.expander("➕ Add a book", expanded=True):
-    tab_scan, tab_search, tab_manual = st.tabs(["📷 Scan ISBN", "🔎 Search", "✍️ Manual"])
+    tab_scan, tab_cover, tab_search, tab_manual = st.tabs(
+        ["📷 Scan ISBN", "📸 Cover OCR", "🔎 Search", "✍️ Manual"]
+    )
 
-    # --- Scan ---
+    # ---- Scan ISBN ----
     with tab_scan:
-        img = st.camera_input("Take a photo of the barcode", help="Good light, fill the frame with the barcode.")
+        img = st.camera_input("Take a photo of the BARCODE", help="Fill the frame; good light.")
         if img is not None:
-            isbn = decode_isbn_from_image(img.getvalue()) if ZXING_READY else None
+            isbn = decode_isbn(img.getvalue())
             if isbn:
                 st.success(f"Scanned ISBN: {isbn}")
-                with st.spinner("Looking up book details..."):
-                    meta = lookup_book_by_isbn_hybrid(isbn)
+                with st.spinner("Looking up metadata..."):
+                    meta = svc.by_isbn(isbn)
                 if meta:
-                    c1, c2 = st.columns([1, 2])
-                    with c1:
-                        thumb = safe_url(meta.get("thumbnail"))
-                        if thumb:
-                            st.image(thumb)
+                    colL, colR = st.columns([1,2])
+                    with colL:
+                        if safe_url(meta.get("thumbnail")):
+                            st.image(meta["thumbnail"])
                         else:
                             st.write("No cover")
-                    with c2:
+                    with colR:
                         st.markdown(f"**{meta.get('title','')}**")
-                        st.caption(meta.get("author", ""))
+                        st.caption(meta.get("author",""))
                         rating = st.slider("Rating", 0, 5, 0, key="scan_rating")
                         status = st.selectbox("Status", STATUS_OPTIONS, index=0, key="scan_status")
                         d = st.date_input("Date (optional)", value=None, format="YYYY-MM-DD", key="scan_date")
-                        # editable metadata
-                        m_pages = st.number_input("Pages", min_value=0, step=1, value=int(meta.get("page_count") or 0))
-                        m_pubdate = st.text_input("Published date", value=meta.get("published_date", ""))
-                        m_publisher = st.text_input("Publisher", value=meta.get("publisher", ""))
-                        m_categories = st.text_input("Categories", value=meta.get("categories", ""))
-                        m_lang = st.text_input("Language", value=meta.get("language", ""))
-                        m_desc = st.text_area("Description", value=meta.get("description", ""), height=120)
+                        # editable meta
+                        m_pages = st.number_input("Pages", 0, 5000, int(meta.get("page_count", 0)))
+                        m_pubdate = st.text_input("Published date", value=meta.get("published_date",""))
+                        m_publisher = st.text_input("Publisher", value=meta.get("publisher",""))
+                        m_categories = st.text_input("Categories", value=meta.get("categories",""))
+                        m_lang = st.text_input("Language", value=meta.get("language",""))
+                        m_desc = st.text_area("Description", value=meta.get("description",""))
                         notes = st.text_area("Your Notes", key="scan_notes")
                         if st.button("Add to library", type="primary"):
-                            add_row({
-                                "isbn": meta.get("isbn", isbn),
-                                "title": meta.get("title", ""),
-                                "author": meta.get("author", ""),
-                                "rating": int(rating),
-                                "notes": notes.strip(),
-                                "thumbnail": meta.get("thumbnail", ""),
-                                "status": status,
-                                "date": d.isoformat() if isinstance(d, date) else "",
-                                "page_count": int(m_pages or 0),
-                                "published_date": m_pubdate.strip(),
-                                "publisher": m_publisher.strip(),
-                                "categories": m_categories.strip(),
-                                "language": m_lang.strip(),
-                                "description": m_desc.strip(),
-                            })
+                            add_book(Book(
+                                isbn=meta.get("isbn", isbn),
+                                title=meta.get("title",""),
+                                author=meta.get("author",""),
+                                rating=int(rating),
+                                notes=notes.strip(),
+                                thumbnail=meta.get("thumbnail",""),
+                                status=status,
+                                date=d.isoformat() if isinstance(d, date) else "",
+                                page_count=int(m_pages or 0),
+                                published_date=m_pubdate.strip(),
+                                publisher=m_publisher.strip(),
+                                categories=m_categories.strip(),
+                                language=m_lang.strip(),
+                                description=m_desc.strip(),
+                                source=meta.get("source","unknown"),
+                            ))
                             st.success("Added!")
                             st.rerun()
                 else:
-                    st.error("No book found for that ISBN. Try Search or Manual.")
+                    st.warning("No match. Try Cover OCR or Manual.")
             else:
-                st.info("Couldn’t detect the barcode—try again closer and well lit.")
+                st.info("Barcode not detected—try again closer and well lit.")
 
-    # --- Search ---
+    # ---- Cover OCR ----
+    with tab_cover:
+        # If OCR (Vision) isn’t available, warn but keep the UI working.
+        if not getattr(ocrmod, "AVAILABLE", False):
+            st.warning(
+                "Cover OCR is unavailable (Vision SDK not installed or credentials missing). "
+                "Install `google-cloud-vision` and set `[gcp_service_account]` in secrets to enable this."
+            )
+    
+        img = st.camera_input(
+            "Take a photo of the FRONT COVER",
+            help="Avoid glare; center the title area."
+        )
+    
+        if img is not None:
+            # Use the safe OCR module wrapper
+            with st.spinner("Reading cover text..."):
+                text = ocrmod.extract_text(img.getvalue())
+    
+            if not text:
+                st.info("No text detected. Try retaking the photo.")
+            else:
+                with st.expander("📝 Extracted text"):
+                    st.code(text)
+    
+                # Heuristic guess for title/author
+                guess_t, guess_a = ocrmod.guess_title_author(text)
+                st.markdown("**Best guess**")
+                c1, c2 = st.columns(2)
+                with c1:
+                    title_guess = st.text_input("Title (guess)", value=guess_t, key="ocr_guess_title")
+                with c2:
+                    author_guess = st.text_input("Author (guess)", value=guess_a, key="ocr_guess_author")
+    
+                # Search candidates on Google Books using extracted text (or title guess)
+                q_default = (guess_t or text.replace("\n", " "))[:120]
+                q = st.text_input("Refine search query", value=q_default, key="ocr_search_q")
+    
+                if st.button("Find candidates", key="ocr_find_candidates"):
+                    with st.spinner("Searching..."):
+                        results = svc.search_text(q, limit=8)
+    
+                    if not results:
+                        st.info("No candidates. You can still add manually below.")
+                    else:
+                        cols = st.columns(2)
+                        for i, r in enumerate(results):
+                            with cols[i % 2]:
+                                thumb = safe_url(r.get("thumbnail"))
+                                if thumb:
+                                    st.image(thumb)
+                                st.markdown(f"**{r.get('title','')}**")
+                                st.caption(r.get("author", ""))
+                                st.caption(f"ISBN: {r.get('isbn') or '—'} • Pages: {r.get('page_count', 0)}")
+    
+                                rating = st.slider("Rating", 0, 5, 0, key=f"ocr_rate_{r['id']}")
+                                status = st.selectbox("Status", STATUS_OPTIONS, index=0, key=f"ocr_status_{r['id']}")
+                                d = st.date_input("Date", value=None, format="YYYY-MM-DD", key=f"ocr_date_{r['id']}")
+                                notes = st.text_input("Notes", key=f"ocr_notes_{r['id']}")
+    
+                                if st.button("Add this", key=f"ocr_add_{r['id']}"):
+                                    add_book(Book(
+                                        isbn=r.get("isbn",""),
+                                        title=r.get("title",""),
+                                        author=r.get("author",""),
+                                        rating=int(rating),
+                                        notes=notes.strip(),
+                                        thumbnail=r.get("thumbnail",""),
+                                        status=status,
+                                        date=d.isoformat() if isinstance(d, date) else "",
+                                        page_count=int(r.get("page_count") or 0),
+                                        published_date=r.get("published_date",""),
+                                        publisher=r.get("publisher",""),
+                                        categories=r.get("categories",""),
+                                        language=r.get("language",""),
+                                        description=r.get("description",""),
+                                        source=r.get("source","google-search"),
+                                    ))
+                                    st.success(f"Added “{r.get('title','(untitled)')}”")
+    
+                # --- Manual add from the guesses ---
+                st.markdown("**Or add manually from the guess**")
+                m1, m2 = st.columns(2)
+                with m1:
+                    m_title = st.text_input("Title *", value=title_guess, key="ocr_m_title")
+                    m_author = st.text_input("Author", value=author_guess, key="ocr_m_author")
+                    m_publisher = st.text_input("Publisher", key="ocr_m_publisher")
+                    m_pages = st.number_input("Pages", min_value=0, step=1, value=0, key="ocr_m_pages")
+                    m_pubdate = st.text_input("Published date", key="ocr_m_pubdate")
+                with m2:
+                    m_categories = st.text_input("Categories", key="ocr_m_categories")
+                    m_lang = st.text_input("Language", key="ocr_m_lang")
+                    m_desc = st.text_area("Description", height=120, key="ocr_m_desc")
+                    m_thumb = st.text_input("Cover URL (optional)", key="ocr_m_thumb")
+                    m_rating = st.slider("Rating", 0, 5, 0, key="ocr_m_rating")
+                    m_status = st.selectbox("Status", STATUS_OPTIONS, index=0, key="ocr_m_status")
+                    m_date = st.date_input("Date (optional)", value=None, format="YYYY-MM-DD", key="ocr_m_date")
+    
+                m_notes = st.text_area("Your Notes", key="ocr_m_notes")
+    
+                if st.button("Add manual (from OCR)", type="primary", key="ocr_m_add"):
+                    if not m_title.strip():
+                        st.warning("Title is required.")
+                    else:
+                        add_book(Book(
+                            isbn="",
+                            title=m_title.strip(),
+                            author=m_author.strip(),
+                            rating=int(m_rating),
+                            notes=m_notes.strip(),
+                            thumbnail=m_thumb.strip(),
+                            status=m_status,
+                            date=m_date.isoformat() if isinstance(m_date, date) else "",
+                            page_count=int(m_pages or 0),
+                            published_date=m_pubdate.strip(),
+                            publisher=m_publisher.strip(),
+                            categories=m_categories.strip(),
+                            language=m_lang.strip(),
+                            description=m_desc.strip(),
+                            source="cover-ocr",
+                        ))
+                        st.success(f"Added “{m_title}”")
+                        st.rerun()
+
+
+    # ---- Search by text ----
     with tab_search:
         q = st.text_input("Title / Author", placeholder="e.g., The Hobbit")
-        if st.button("Search Google Books", type="primary"):
+        if st.button("Search", type="primary"):
             with st.spinner("Searching..."):
-                results = google_books_search(q.strip(), limit=12)
+                results = svc.search_text(q.strip(), limit=12)
             if not results:
                 st.info("No results.")
             else:
                 grid_cols = st.slider("Grid columns", 3, 5, 4, key="search_cols")
                 for i in range(0, len(results), grid_cols):
-                    row_items = results[i:i + grid_cols]
-                    cols = st.columns(len(row_items))
-                    for col, r in zip(cols, row_items):
+                    row = results[i:i+grid_cols]
+                    cols = st.columns(len(row))
+                    for col, r in zip(cols, row):
                         with col:
-                            url = safe_url(r["thumbnail"])
-                            if url:
-                                st.image(url)
+                            if safe_url(r["thumbnail"]): st.image(r["thumbnail"])
                             st.markdown(f"**{r['title']}**")
                             st.caption(r["author"])
                             st.text(f"ISBN: {r['isbn'] or '—'}")
@@ -672,107 +241,84 @@ with st.expander("➕ Add a book", expanded=True):
                             status = st.selectbox("Status", STATUS_OPTIONS, index=0, key=f"status_{r['id']}")
                             d = st.date_input("Date", value=None, format="YYYY-MM-DD", key=f"date_{r['id']}")
                             notes = st.text_input("Notes", key=f"notes_{r['id']}")
-                            if st.button("Add", key=f"add_{r['id']}", width="stretch"):
-                                add_row({
-                                    "isbn": r["isbn"],
-                                    "title": r["title"],
-                                    "author": r["author"],
-                                    "rating": int(rating),
-                                    "notes": notes.strip(),
-                                    "thumbnail": r["thumbnail"],
-                                    "status": status,
-                                    "date": d.isoformat() if isinstance(d, date) else "",
-                                    "page_count": int(r.get("page_count") or 0),
-                                    "published_date": r.get("published_date",""),
-                                    "publisher": r.get("publisher",""),
-                                    "categories": r.get("categories",""),
-                                    "language": r.get("language",""),
-                                    "description": r.get("description",""),
-                                })
+                            if st.button("Add", key=f"add_{r['id']}", type="primary"):
+                                add_book(Book(
+                                    isbn=r["isbn"],
+                                    title=r["title"],
+                                    author=r["author"],
+                                    rating=int(rating),
+                                    notes=notes.strip(),
+                                    thumbnail=r["thumbnail"],
+                                    status=status,
+                                    date=d.isoformat() if isinstance(d, date) else "",
+                                    page_count=int(r.get("page_count") or 0),
+                                    published_date=r.get("published_date",""),
+                                    publisher=r.get("publisher",""),
+                                    categories=r.get("categories",""),
+                                    language=r.get("language",""),
+                                    description=r.get("description",""),
+                                    source=r.get("source","google-search"),
+                                ))
                                 st.success(f"Added “{r['title']}”")
 
-    # --- Manual ---
+    # ---- Manual ----
     with tab_manual:
-        st.markdown("#### A) Manual ISBN lookup")
-        isbn_input = st.text_input("Enter ISBN (10 or 13)")
-        col_l, col_r = st.columns([1,3])
-        with col_l:
-            if st.button("Lookup ISBN"):
-                with st.spinner("Looking up..."):
-                    meta = lookup_book_by_isbn_hybrid(isbn_input)
-                if meta:
-                    st.session_state["manual_prefill"] = meta
-                    st.success("Found book! Prefilled below.")
-                else:
-                    st.session_state["manual_prefill"] = {"isbn": clean_isbn(isbn_input)}
-                    st.info("No API/web result. Prefilled the form with the ISBN so you can enter details manually.")
-        with col_r:
-            st.caption("Tip: Works best with 13-digit ISBN. Remove spaces/dashes if needed.")
-
-        st.markdown("#### B) Manual add / edit fields")
-        pre = st.session_state.get("manual_prefill", {})
+        st.markdown("Use ISBN lookup in the 'Scan' tab, or add everything by hand here.")
         c1, c2 = st.columns(2)
         with c1:
-            m_title = st.text_input("Title *", value=pre.get("title", ""))
-            m_author = st.text_input("Author", value=pre.get("author", ""))
-            m_isbn = st.text_input("ISBN", value=pre.get("isbn", ""))
-            m_publisher = st.text_input("Publisher", value=pre.get("publisher", ""))
-            m_pages = st.number_input("Pages", min_value=0, step=1, value=int(pre.get("page_count") or 0))
-            m_pubdate = st.text_input("Published date", value=pre.get("published_date", ""))
+            m_title = st.text_input("Title *")
+            m_author = st.text_input("Author")
+            m_isbn = st.text_input("ISBN")
+            m_publisher = st.text_input("Publisher")
+            m_pages = st.number_input("Pages", min_value=0, step=1, value=0)
+            m_pubdate = st.text_input("Published date")
         with c2:
-            m_categories = st.text_input("Categories", value=pre.get("categories", ""))
-            m_lang = st.text_input("Language", value=pre.get("language", ""))
-            m_desc = st.text_area("Description", value=pre.get("description", ""), height=120)
-            m_thumb = st.text_input("Cover URL (optional)", value=pre.get("thumbnail", ""))
+            m_categories = st.text_input("Categories")
+            m_lang = st.text_input("Language")
+            m_desc = st.text_area("Description", height=120)
+            m_thumb = st.text_input("Cover URL (optional)")
             m_rating = st.slider("Rating", 0, 5, 0)
             m_status = st.selectbox("Status", STATUS_OPTIONS, index=0)
             m_date = st.date_input("Date (optional)", value=None, format="YYYY-MM-DD")
         m_notes = st.text_area("Your Notes")
-
         if st.button("Add manual", type="primary"):
             if not m_title.strip():
                 st.warning("Title is required.")
             else:
-                add_row({
-                    "isbn": m_isbn.strip(),
-                    "title": m_title.strip(),
-                    "author": m_author.strip(),
-                    "rating": int(m_rating),
-                    "notes": m_notes.strip(),
-                    "thumbnail": m_thumb.strip(),
-                    "status": m_status,
-                    "date": m_date.isoformat() if isinstance(m_date, date) else "",
-                    "page_count": int(m_pages or 0),
-                    "published_date": m_pubdate.strip(),
-                    "publisher": m_publisher.strip(),
-                    "categories": m_categories.strip(),
-                    "language": m_lang.strip(),
-                    "description": m_desc.strip(),
-                })
+                add_book(Book(
+                    isbn=m_isbn.strip(),
+                    title=m_title.strip(),
+                    author=m_author.strip(),
+                    rating=int(m_rating),
+                    notes=m_notes.strip(),
+                    thumbnail=m_thumb.strip(),
+                    status=m_status,
+                    date=m_date.isoformat() if isinstance(m_date, date) else "",
+                    page_count=int(m_pages or 0),
+                    published_date=m_pubdate.strip(),
+                    publisher=m_publisher.strip(),
+                    categories=m_categories.strip(),
+                    language=m_lang.strip(),
+                    description=m_desc.strip(),
+                    source="manual",
+                ))
                 st.success(f"Added “{m_title}”")
-                st.session_state.pop("manual_prefill", None)
                 st.rerun()
 
 st.divider()
 st.subheader("📖 Your library")
 
-# -----------------------------
-# Load & list current entries
-# -----------------------------
-df = read_df()
+df = read_all()
 
-# Filters & view
-left, right = st.columns([3, 2])
+# Filters
+left, right = st.columns([3,2])
 with left:
     f_query = st.text_input("Filter", placeholder="Search title/author/ISBN/notes/categories/publisher")
 with right:
     c1, c2, c3 = st.columns(3)
-    with c1:
-        f_min = st.selectbox("Min rating", options=[0, 1, 2, 3, 4, 5], index=0)
-    with c2:
-        f_status = st.selectbox("Status", options=["All"] + STATUS_OPTIONS, index=0)
-    with c3:
-        view = st.radio("View", options=["List", "Grid"], index=0, horizontal=True)
+    with c1: f_min = st.selectbox("Min rating", [0,1,2,3,4,5], index=0)
+    with c2: f_status = st.selectbox("Status", ["All"] + STATUS_OPTIONS, index=0)
+    with c3: view = st.radio("View", ["List","Grid"], index=0, horizontal=True)
 
 fdf = df.copy()
 if f_query:
@@ -790,106 +336,81 @@ if f_status != "All":
     fdf = fdf[fdf["status"] == f_status]
 fdf = fdf[fdf["rating"] >= f_min].sort_values("added_at", ascending=False)
 
-# Render Grid/List
 todelete = []
 
 if view == "Grid":
     cols_count = st.slider("Grid columns", 3, 6, 4, key="library_cols")
     items = list(fdf.to_dict(orient="records"))
     for i in range(0, len(items), cols_count):
-        row_items = items[i:i + cols_count]
-        cols = st.columns(len(row_items))
-        for col, it in zip(cols, row_items):
+        row = items[i:i+cols_count]
+        cols = st.columns(len(row))
+        for col, it in zip(cols, row):
             with col:
                 card = st.container(border=True)
                 with card:
-                    url = safe_url(it.get("thumbnail"))
-                    if url:
-                        st.image(url)
-                    else:
-                        st.write("No cover")
+                    if safe_url(it.get("thumbnail")): st.image(it["thumbnail"])
+                    else: st.write("No cover")
                     st.markdown(f"**{it['title']}**")
-                    st.caption(it.get("author", ""))
-                    st.write(f"⭐ {int(it.get('rating', 0))} • {it.get('status', 'Wishlist')}")
-                    st.write(f"ISBN: {it.get('isbn', '—')}")
+                    st.caption(it.get("author",""))
+                    st.write(f"⭐ {int(it.get('rating',0))} • {it.get('status','Wishlist')} • Src: {it.get('source','')}")
+                    st.write(f"ISBN: {it.get('isbn','—')}")
                     extra = []
-                    if it.get("page_count"):
-                        extra.append(f"{int(it['page_count'])} pages")
-                    if it.get("published_date"):
-                        extra.append(it["published_date"])
-                    if extra:
-                        st.caption(" · ".join(extra))
-                    if it.get("publisher"):
-                        st.caption(f"Publisher: {it['publisher']}")
-                    if it.get("categories"):
-                        st.caption(f"Categories: {it['categories']}")
-                    if it.get("language"):
-                        st.caption(f"Lang: {it['language']}")
-                    if it.get("notes"):
-                        st.write(it["notes"])
+                    if it.get("page_count"): extra.append(f"{int(it['page_count'])} pages")
+                    if it.get("published_date"): extra.append(it["published_date"])
+                    if extra: st.caption(" · ".join(extra))
+                    if it.get("publisher"): st.caption(f"Publisher: {it['publisher']}")
+                    if it.get("categories"): st.caption(f"Categories: {it['categories']}")
+                    if it.get("language"): st.caption(f"Lang: {it['language']}")
+                    if it.get("notes"): st.write(it["notes"])
                     if st.button("Delete", key=f"del_{it['id']}"):
                         todelete.append(int(it["id"]))
 else:
     for _, row in fdf.iterrows():
         box = st.container(border=True)
-        cols = box.columns([1, 5, 2])
+        cols = box.columns([1,5,2])
         with cols[0]:
-            thumb = safe_url(row.get("thumbnail"))
-            if thumb:
-                st.image(thumb)
-            else:
-                st.write("No cover")
+            if safe_url(row.get("thumbnail")): st.image(row["thumbnail"])
+            else: st.write("No cover")
         with cols[1]:
             st.markdown(f"**{row['title']}**")
-            st.caption(row.get("author", ""))
-            st.write(f"⭐ {int(row.get('rating', 0))} • {row.get('status', 'Wishlist')} • ISBN: {row.get('isbn', '—')}")
+            st.caption(row.get("author",""))
+            st.write(f"⭐ {int(row.get('rating',0))} • {row.get('status','Wishlist')} • Src: {row.get('source','')}")
+            st.write(f"ISBN: {row.get('isbn','—')}")
             extra = []
-            if row.get("page_count"):
-                extra.append(f"{int(row['page_count'])} pages")
-            if row.get("published_date"):
-                extra.append(row["published_date"])
-            if extra:
-                st.caption(" · ".join(extra))
-            if row.get("publisher"):
-                st.caption(f"Publisher: {row['publisher']}")
-            if row.get("categories"):
-                st.caption(f"Categories: {row['categories']}")
-            if row.get("language"):
-                st.caption(f"Lang: {row['language']}")
+            if row.get("page_count"): extra.append(f"{int(row['page_count'])} pages")
+            if row.get("published_date"): extra.append(row["published_date"])
+            if extra: st.caption(" · ".join(extra))
+            if row.get("publisher"): st.caption(f"Publisher: {row['publisher']}")
+            if row.get("categories"): st.caption(f"Categories: {row['categories']}")
+            if row.get("language"): st.caption(f"Lang: {row['language']}")
             if row.get("description"):
-                with st.expander("Description"):
-                    st.write(row["description"])
-            if row.get("notes"):
-                st.write(row["notes"])
-            st.caption(f"Added: {row.get('added_at', '')}")
+                with st.expander("Description"): st.write(row["description"])
+            if row.get("notes"): st.write(row["notes"])
+            st.caption(f"Added: {row.get('added_at','')}")
         with cols[2]:
             if st.button("Delete", key=f"del_{row['id']}"):
                 todelete.append(int(row["id"]))
 
 if todelete:
-    delete_rows(todelete)
+    delete_ids(todelete)
     st.success("Deleted.")
     st.rerun()
 
-st.download_button(
-    "⬇️ Export CSV",
-    data=fdf.to_csv(index=False),
-    file_name="books.csv",
-    mime="text/csv",
-)
+st.download_button("⬇️ Export CSV", data=fdf.to_csv(index=False), file_name="books.csv", mime="text/csv")
 
 st.divider()
-
-# -----------------------------
-# ADMIN: Edit all entries (sheet view)
-# -----------------------------
 st.subheader("✏️ Edit all entries (sheet view)")
 
 with st.expander("Current entries (read-only preview)"):
     st.dataframe(df.sort_values("added_at", ascending=False), width="stretch", hide_index=True)
 
 st.caption("You can edit the table below and click **Save changes** to update the Google Sheet.")
+
 editable = df.copy()
+
+# Convert 'date' strings → datetime for the editor
+if "date" in editable.columns:
+    editable["date"] = pd.to_datetime(editable["date"], errors="coerce")
 
 try:
     desc_col = st.column_config.TextAreaColumn("description")
@@ -917,21 +438,48 @@ edited = st.data_editor(
         "author": st.column_config.TextColumn("author"),
         "id": st.column_config.NumberColumn("id", help="Row id (unique integer)"),
         "added_at": st.column_config.TextColumn("added_at", help="Auto timestamp (ISO)."),
+        "source": st.column_config.TextColumn("source"),
     },
     hide_index=True,
     key="editor",
 )
 
-c1, c2 = st.columns([1, 3])
+ed = edited.copy()
+
+# Convert datetime/date → ISO string for saving
+if "date" in ed.columns:
+    def _to_iso(x):
+        if pd.isna(x):
+            return ""
+        if isinstance(x, pd.Timestamp):
+            return x.date().isoformat()
+        if isinstance(x, ddate):
+            return x.isoformat()
+        # If something slipped through as string already:
+        s = str(x).strip()
+        try:
+            return pd.to_datetime(s, errors="coerce").date().isoformat()
+        except Exception:
+            return s
+    ed["date"] = ed["date"].apply(_to_iso)
+
+# Now continue with your duplicate-id check and write_all(ed)
+if ed["id"].duplicated().any():
+    st.error("Duplicate ids found. Make sure each row has a unique 'id'.")
+else:
+    write_all(ed)
+    st.success("Sheet updated.")
+    st.rerun()
+
+c1, c2 = st.columns([1,3])
 with c1:
     if st.button("Save changes", type="primary"):
-        ed = normalize_columns(edited.copy())
-        if ed["id"].duplicated().any():
+        # validate IDs
+        if edited["id"].duplicated().any():
             st.error("Duplicate ids found. Make sure each row has a unique 'id'.")
         else:
-            ed.loc[ed["added_at"].eq(""), "added_at"] = datetime.now().isoformat(timespec="seconds")
-            write_df(ed)
+            write_all(edited)
             st.success("Sheet updated.")
             st.rerun()
 with c2:
-    st.caption("Tip: To add a new row, scroll to the bottom of the editor and click “Add row”. Fill at least a title and a unique id.")
+    st.caption("Tip: Add a row at the bottom to insert new entries here.")
