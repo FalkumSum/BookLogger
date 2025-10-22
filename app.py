@@ -406,12 +406,14 @@ with st.expander("Current entries (read-only preview)"):
 
 st.caption("You can edit the table below and click **Save changes** to update the Google Sheet.")
 
+# Make a working copy for the editor
 editable = df.copy()
 
-# Convert 'date' strings → datetime for the editor
+# Convert 'date' (string) → datetime so DateColumn works
 if "date" in editable.columns:
     editable["date"] = pd.to_datetime(editable["date"], errors="coerce")
 
+# Description column type (fallback if TextAreaColumn not available)
 try:
     desc_col = st.column_config.TextAreaColumn("description")
 except Exception:
@@ -444,42 +446,43 @@ edited = st.data_editor(
     key="editor",
 )
 
-ed = edited.copy()
-
-# Convert datetime/date → ISO string for saving
-if "date" in ed.columns:
-    def _to_iso(x):
-        if pd.isna(x):
-            return ""
-        if isinstance(x, pd.Timestamp):
-            return x.date().isoformat()
-        if isinstance(x, ddate):
-            return x.isoformat()
-        # If something slipped through as string already:
-        s = str(x).strip()
-        try:
-            return pd.to_datetime(s, errors="coerce").date().isoformat()
-        except Exception:
-            return s
-    ed["date"] = ed["date"].apply(_to_iso)
-
-# Now continue with your duplicate-id check and write_all(ed)
-if ed["id"].duplicated().any():
-    st.error("Duplicate ids found. Make sure each row has a unique 'id'.")
-else:
-    write_all(ed)
-    st.success("Sheet updated.")
-    st.rerun()
-
-c1, c2 = st.columns([1,3])
+# --- Save button only (no auto-write above) ---
+c1, c2 = st.columns([1, 3])
 with c1:
-    if st.button("Save changes", type="primary"):
-        # validate IDs
-        if edited["id"].duplicated().any():
+    if st.button("Save changes", type="primary", key="save_changes_btn"):
+        ed = edited.copy()
+
+        # Convert datetime/date → ISO string for saving
+        if "date" in ed.columns:
+            def _to_iso(x):
+                if pd.isna(x):
+                    return ""
+                if isinstance(x, (pd.Timestamp, datetime, date)):
+                    # pd.Timestamp.isoformat() includes time; keep just the date
+                    try:
+                        return x.date().isoformat()
+                    except Exception:
+                        return str(x).split("T")[0]
+                # fallback from string
+                try:
+                    return pd.to_datetime(str(x), errors="coerce").date().isoformat()
+                except Exception:
+                    return str(x).strip()
+            ed["date"] = ed["date"].apply(_to_iso)
+
+        # Validate IDs
+        if ed["id"].duplicated().any():
             st.error("Duplicate ids found. Make sure each row has a unique 'id'.")
         else:
-            write_all(edited)
-            st.success("Sheet updated.")
-            st.rerun()
+            # Optional cooldown: avoid rapid consecutive writes
+            last = st.session_state.get("last_save_ts", 0.0)
+            now_ts = datetime.now().timestamp()
+            if now_ts - last < 5:
+                st.warning("You saved just now—try again in a few seconds.")
+            else:
+                write_all(ed)          # single, quota-friendly write
+                st.session_state["last_save_ts"] = now_ts
+                st.success("Sheet updated.")
+                st.rerun()
 with c2:
     st.caption("Tip: Add a row at the bottom to insert new entries here.")
