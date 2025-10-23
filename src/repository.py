@@ -1,7 +1,8 @@
 # src/repository.py
-from datetime import datetime
+from datetime import datetime, date
 from typing import List
 import time
+import math
 
 import pandas as pd
 import streamlit as st
@@ -12,10 +13,58 @@ from gspread_dataframe import get_as_dataframe
 
 from .models import Book
 
+# --- NEW: optional NumPy import (for scalar detection) ---
+try:
+    import numpy as np
+except Exception:
+    np = None
+
 SCOPE_SHEETS = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
+
+# --- NEW: normalization helpers for JSON/Sheets ---
+def _to_native(value):
+    """Convert NumPy/Pandas scalars & datetimes into JSON-serializable Python types."""
+    # Empty / None stays empty
+    if value is None:
+        return None
+
+    # Convert NaN to empty
+    if isinstance(value, float) and math.isnan(value):
+        return None
+
+    # NumPy scalars (int64, float64, bool_, etc.)
+    if np is not None and isinstance(value, np.generic):
+        return value.item()
+
+    # Pandas Timestamp / NaT (avoid importing pandas just for types)
+    cls = type(value).__name__
+    if cls == "Timestamp":
+        # to_pydatetime() works for valid Timestamps; NaT will raise or behave oddly
+        try:
+            return value.to_pydatetime().isoformat()
+        except Exception:
+            return None
+
+    # Python datetime/date -> ISO8601 (USER_ENTERED lets Sheets parse it)
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+
+    # Lists/tuples (keep it flat if you use them)
+    if isinstance(value, (list, tuple)):
+        return [_to_native(v) for v in value]
+
+    # Strings / ints / floats / bools are already fine
+    return value
+
+def _to_native_row(values):
+    return [_to_native(v) for v in values]
+
+def _to_native_2d(values_2d):
+    return [[_to_native(v) for v in row] for row in values_2d]
+# --- END helpers ---
 
 @st.cache_resource
 def _ws():
@@ -35,6 +84,8 @@ def _safe_update(ws, range_name, values, retries: int = 5):
     """
     Single values.update with exponential backoff on 429.
     """
+    # --- ensure JSON-safe before sending ---
+    values = _to_native_2d(values)
     for attempt in range(retries):
         try:
             return ws.update(range_name, values, value_input_option="USER_ENTERED")
@@ -46,6 +97,8 @@ def _safe_update(ws, range_name, values, retries: int = 5):
             raise
 
 def _safe_append_row(ws, values, retries: int = 5):
+    # --- ensure JSON-safe before sending ---
+    values = _to_native_row(values)
     for attempt in range(retries):
         try:
             return ws.append_row(values, value_input_option="USER_ENTERED")
@@ -86,7 +139,8 @@ def _to_values(df: pd.DataFrame) -> list[list]:
     # Make sure NaNs are blanks to avoid 'nan' strings
     df = df.where(pd.notnull(df), "")
     values = [headers] + df[headers].values.tolist()
-    return values
+    # --- ensure JSON-safe before returning ---
+    return _to_native_2d(values)
 
 def write_all(df: pd.DataFrame):
     """
@@ -117,7 +171,6 @@ def add_book(book: Book):
         book.added_at = datetime.now().isoformat(timespec="seconds")
 
     # If the sheet is fresh and only contains headers, ensure headers exist in row 1
-    # (Create was done in _ws(), but be defensive.)
     if ws.row_count == 0:
         _safe_update(ws, 'A1', [Book.headers()])
 
