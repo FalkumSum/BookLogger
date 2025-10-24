@@ -1,5 +1,5 @@
 [project]
-name = "booklogger"
+name = "booklogger2"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
@@ -7,10 +7,10 @@ requires-python = ">=3.12"
 dependencies = [
     "beautifulsoup4>=4.14.2",
     "google-auth>=2.41.1",
-    "google-cloud>=0.34.0",
-    "google-cloud-vision>=3.10.2",
+    "google-cloud-vision>=3.11.0",
     "gspread>=6.2.1",
     "gspread-dataframe>=4.0.0",
+    "isbnlib>=3.10.14",
     "pandas>=2.3.3",
     "pillow>=11.3.0",
     "requests>=2.32.5",
